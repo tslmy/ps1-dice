@@ -122,7 +122,7 @@ void draw_text(RenderContext *ctx, int x, int y, int z, const char *text)
 
 #define PADDLE_WIDTH 8
 #define PADDLE_HEIGHT 60
-#define BALL_SIZE 8
+#define BALL_SIZE 16
 #define PADDLE_SPEED 4
 #define INITIAL_BALL_SPEED 2
 #define PADDLE_MARGIN 10
@@ -229,22 +229,22 @@ void draw_paddle(RenderContext *ctx, int x, int y)
 void draw_ball(RenderContext *ctx, Ball *ball, TIM_IMAGE *tim_ball)
 {
     SPRT_16 *sprt = (SPRT_16 *)new_primitive(ctx, 1, sizeof(SPRT_16));
-    
+
     // Initialize sprite properties
     setSprt16(sprt);
     setXY0(sprt, ball->x, ball->y);
-    setWH(sprt, BALL_SIZE, BALL_SIZE);
     setRGB0(sprt, 128, 128, 128); // Neutral color (no tint)
-    
+    setUV0(sprt, 0, 0);
+
     // Configure texture properties from TIM image
     if (tim_ball->mode & 0x8) // Check if CLUT exists
     {
         setClut(sprt, tim_ball->crect->x, tim_ball->crect->y);
     }
-    
+
     // Set texture page and UV coordinates
-    setTPage(sprt, getTPage(tim_ball->mode & 0x3, 0, tim_ball->prect->x, tim_ball->prect->y));
-    setUV0(sprt, tim_ball->prect->x & 0xFF, tim_ball->prect->y & 0xFF);
+    DR_TPAGE *tpri = (DR_TPAGE *)new_primitive(ctx, 1, sizeof(DR_TPAGE));
+    setDrawTPage(tpri, 0, 0, getTPage(tim_ball->mode & 0x3, 0, tim_ball->prect->x, tim_ball->prect->y));
 }
 
 void draw_center_line(RenderContext *ctx)

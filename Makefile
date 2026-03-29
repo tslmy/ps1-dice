@@ -1,4 +1,4 @@
-.PHONY: prepare build clean rename run run-fast build-run emulate up dist zip
+.PHONY: prepare build clean rename run run-fast build-run emulate up dist zip gen_assets
 
 # Default DuckStation path for macOS
 DUCKSTATION ?= /Applications/DuckStation.app/Contents/MacOS/DuckStation
@@ -7,7 +7,10 @@ DUCKSTATION ?= /Applications/DuckStation.app/Contents/MacOS/DuckStation
 prepare:
 	docker build --platform linux/amd64 . -t psn00bsdk
 
-build: png2tim parcel compile
+gen_assets:
+	python3 tools/gen_dice_atlas.py
+
+build: gen_assets png2tim parcel compile
 	
 compile:
 	@docker run --platform linux/amd64 --rm -v $(PWD)/src:/workspace/src -v $(PWD)/out:/workspace/build -w /workspace/src psn00bsdk sh -c "cmake --preset default . && cmake --build /workspace/build"

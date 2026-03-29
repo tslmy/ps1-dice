@@ -32,10 +32,13 @@ def parcel_tim_files
    # Read the CMakeLists.txt file
    cmake_content = File.read(cmake_file)
 
+   # Extract the project/target name from CMakeLists.txt
+   project_name = cmake_content.match(/psn00bsdk_add_executable\((\w+)/)[1] rescue 'dice_roller'
+
    # Create the new content to insert
    cmake_includes = tim_files.map do |tim_file|
       target_name = File.basename(tim_file, '.tim')
-      "psn00bsdk_target_incbin(hello_pong PRIVATE tim_#{target_name} #{tim_file})"
+      "psn00bsdk_target_incbin(#{project_name} PRIVATE tim_#{target_name} #{tim_file})"
    end
 
    cmake_includes = cmake_includes.join("\n")

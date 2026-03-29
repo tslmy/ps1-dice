@@ -1,4 +1,4 @@
-.PHONY: prepare build clean rename run run-fast build-run emulate up dist zip gen_assets
+.PHONY: prepare build clean rename run run-fast build-run emulate up dist zip gen_assets screenshot
 
 # Default DuckStation path for macOS
 DUCKSTATION ?= /Applications/DuckStation.app/Contents/MacOS/DuckStation
@@ -57,6 +57,9 @@ emulate: build run-fast
 
 # Build and run the game with fast boot in one command
 up: prepare emulate
+
+screenshot: build
+	DUCKSTATION="$(DUCKSTATION)" ./tools/emu_screenshot.sh $(EMU_WAIT) $(SCREENSHOT_OUT)
 
 dist: clean build zip
 

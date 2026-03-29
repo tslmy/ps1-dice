@@ -8,7 +8,7 @@ prepare:
 	docker build --platform linux/amd64 . -t psn00bsdk
 
 gen_assets:
-	python3 tools/gen_dice_atlas.py
+	uv run --with pillow tools/gen_dice_atlas.py
 
 build: gen_assets png2tim parcel compile
 	

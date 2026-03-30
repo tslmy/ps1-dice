@@ -2,487 +2,504 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <psxsio.h>
+#include <stdlib.h>
 #include <psxgpu.h>
-#include <sys/types.h>
+#include <psxgte.h>
+#include <psxpad.h>
+#include <psxapi.h>
+#include <inline_c.h>
 #include "libs/game_pad.h"
-#include "libs/numeric.h"
-#include "libs/math.h"
 
-// Length of the ordering table, i.e. the range Z coordinates can have, 0-15 in
-// this case. Larger values will allow for more granularity with depth (useful
-// when drawing a complex 3D scene) at the expense of RAM usage and performance.
-#define OT_LENGTH 16
+/* ── Display / OT constants ─────────────────────────────────────────── */
 
-// Size of the buffer GPU commands and primitives are written to. If the program
-// crashes due to too many primitives being drawn, increase this value.
-#define BUFFER_LENGTH 8192
+#define SCREEN_XRES 320
+#define SCREEN_YRES 240
+#define OT_LENGTH 1024
+#define BUFFER_LENGTH 16384
 
-// region images
-extern u_long tim_ball16c[];
-// endregion
+/* ── Fixed-point helpers (20.12) ────────────────────────────────────── */
 
-/* Framebuffer/display list class */
+#define FP_SHIFT 12
+#define FP_ONE (1 << FP_SHIFT)
+#define FP_HALF (FP_ONE >> 1)
+
+#define INT_TO_FP(x) ((x) << FP_SHIFT)
+#define FP_TO_INT(x) ((x) >> FP_SHIFT)
+#define FP_MUL(a, b) ((int32_t)(((int64_t)(a) * (b)) >> FP_SHIFT))
+#define FP_DIV(a, b) ((int32_t)(((int64_t)(a) << FP_SHIFT) / (b)))
+
+/* ── Render context (kept from original template) ───────────────────── */
 
 typedef struct
 {
-   DISPENV disp_env;
-   DRAWENV draw_env;
-
-   uint32_t ot[OT_LENGTH];
-   uint8_t buffer[BUFFER_LENGTH];
+    DISPENV disp_env;
+    DRAWENV draw_env;
+    uint32_t ot[OT_LENGTH];
+    uint8_t buffer[BUFFER_LENGTH];
 } RenderBuffer;
 
 typedef struct
 {
-   RenderBuffer buffers[2];
-   uint8_t *next_packet;
-   int active_buffer;
+    RenderBuffer buffers[2];
+    uint8_t *next_packet;
+    int active_buffer;
 } RenderContext;
 
-void initialize_render_context(RenderContext *ctx, int w, int h, int r, int g, int b)
+static void initialize_render_context(RenderContext *ctx, int w, int h, int r, int g, int b)
 {
-   // Place the two framebuffers vertically in VRAM.
-   SetDefDrawEnv(&(ctx->buffers[0].draw_env), 0, 0, w, h);
-   SetDefDispEnv(&(ctx->buffers[0].disp_env), 0, 0, w, h);
-   SetDefDrawEnv(&(ctx->buffers[1].draw_env), 0, h, w, h);
-   SetDefDispEnv(&(ctx->buffers[1].disp_env), 0, h, w, h);
+    SetDefDrawEnv(&ctx->buffers[0].draw_env, 0, 0, w, h);
+    SetDefDispEnv(&ctx->buffers[0].disp_env, 0, h, w, h);
+    SetDefDrawEnv(&ctx->buffers[1].draw_env, 0, h, w, h);
+    SetDefDispEnv(&ctx->buffers[1].disp_env, 0, 0, w, h);
 
-   // Set the default background color and enable auto-clearing.
-   setRGB0(&(ctx->buffers[0].draw_env), r, g, b);
-   setRGB0(&(ctx->buffers[1].draw_env), r, g, b);
-   ctx->buffers[0].draw_env.isbg = 1;
-   ctx->buffers[1].draw_env.isbg = 1;
+    setRGB0(&ctx->buffers[0].draw_env, r, g, b);
+    setRGB0(&ctx->buffers[1].draw_env, r, g, b);
+    ctx->buffers[0].draw_env.isbg = 1;
+    ctx->buffers[1].draw_env.isbg = 1;
 
-   // Initialize the first buffer and clear its OT so that it can be used for
-   // drawing.
-   ctx->active_buffer = 0;
-   ctx->next_packet = ctx->buffers[0].buffer;
-   ClearOTagR(ctx->buffers[0].ot, OT_LENGTH);
-
-   // Turn on the video output.
-   SetDispMask(1);
+    ctx->active_buffer = 0;
+    ctx->next_packet = ctx->buffers[0].buffer;
+    ClearOTagR(ctx->buffers[0].ot, OT_LENGTH);
+    SetDispMask(1);
 }
 
-void flip_buffers(RenderContext *ctx)
+static void flip_buffers(RenderContext *ctx)
 {
-   // Wait for the GPU to finish drawing, then wait for vblank in order to
-   // prevent screen tearing.
-   DrawSync(0);
-   VSync(0);
+    DrawSync(0);
+    VSync(0);
 
-   RenderBuffer *draw_buffer = &(ctx->buffers[ctx->active_buffer]);
-   RenderBuffer *disp_buffer = &(ctx->buffers[ctx->active_buffer ^ 1]);
+    RenderBuffer *draw = &ctx->buffers[ctx->active_buffer];
+    RenderBuffer *disp = &ctx->buffers[ctx->active_buffer ^ 1];
 
-   // Display the framebuffer the GPU has just finished drawing and start
-   // rendering the display list that was filled up in the main loop.
-   PutDispEnv(&(disp_buffer->disp_env));
-   DrawOTagEnv(&(draw_buffer->ot[OT_LENGTH - 1]), &(draw_buffer->draw_env));
+    PutDispEnv(&disp->disp_env);
+    DrawOTagEnv(&draw->ot[OT_LENGTH - 1], &draw->draw_env);
 
-   // Switch over to the next buffer, clear it and reset the packet allocation
-   // pointer.
-   ctx->active_buffer ^= 1;
-   ctx->next_packet = disp_buffer->buffer;
-   ClearOTagR(disp_buffer->ot, OT_LENGTH);
+    ctx->active_buffer ^= 1;
+    ctx->next_packet = disp->buffer;
+    ClearOTagR(disp->ot, OT_LENGTH);
 }
 
-void *new_primitive(RenderContext *ctx, int z, size_t size)
+static void *new_primitive(RenderContext *ctx, int z, size_t size)
 {
-   // Place the primitive after all previously allocated primitives, then
-   // insert it into the OT and bump the allocation pointer.
-   RenderBuffer *buffer = &(ctx->buffers[ctx->active_buffer]);
-   uint8_t *prim = ctx->next_packet;
-
-   addPrim(&(buffer->ot[z]), prim);
-   ctx->next_packet += size;
-
-   // Make sure we haven't yet run out of space for future primitives.
-   assert(ctx->next_packet <= &(buffer->buffer[BUFFER_LENGTH]));
-
-   return (void *)prim;
+    RenderBuffer *buf = &ctx->buffers[ctx->active_buffer];
+    uint8_t *prim = ctx->next_packet;
+    if (z < 0)
+        z = 0;
+    if (z >= OT_LENGTH)
+        z = OT_LENGTH - 1;
+    addPrim(&buf->ot[z], prim);
+    ctx->next_packet += size;
+    assert(ctx->next_packet <= &buf->buffer[BUFFER_LENGTH]);
+    return (void *)prim;
 }
 
-// A simple helper for drawing text using PSn00bSDK's debug font API. Note that
-// FntSort() requires the debug font texture to be uploaded to VRAM beforehand
-// by calling FntLoad().
-void draw_text(RenderContext *ctx, int x, int y, int z, const char *text)
+static void draw_text(RenderContext *ctx, int x, int y, int z, const char *text)
 {
-   RenderBuffer *buffer = &(ctx->buffers[ctx->active_buffer]);
-
-   ctx->next_packet = (uint8_t *)
-       FntSort(&(buffer->ot[z]), ctx->next_packet, x, y, text);
-
-   assert(ctx->next_packet <= &(buffer->buffer[BUFFER_LENGTH]));
+    RenderBuffer *buf = &ctx->buffers[ctx->active_buffer];
+    ctx->next_packet = (uint8_t *)
+        FntSort(&buf->ot[z], ctx->next_packet, x, y, text);
+    assert(ctx->next_packet <= &buf->buffer[BUFFER_LENGTH]);
 }
 
-/* Pong Game Structures and Constants */
+/* ── Texture loading ────────────────────────────────────────────────── */
 
-#define SCREEN_XRES 320
-#define SCREEN_YRES 240
+extern const uint32_t tim_dice_atlas[];
 
-#define PADDLE_WIDTH 8
-#define PADDLE_HEIGHT 60
-#define BALL_SIZE 16
-#define PADDLE_SPEED 4
-#define INITIAL_BALL_SPEED 2
-#define PADDLE_MARGIN 10
+static TIM_IMAGE dice_tim;
+
+static void load_tim(TIM_IMAGE *out, const uint32_t *data)
+{
+    GetTimInfo(data, out);
+    LoadImage(out->prect, out->paddr);
+    if (out->mode & 0x8)
+        LoadImage(out->crect, out->caddr);
+    DrawSync(0);
+}
+
+/* ── Cube geometry ──────────────────────────────────────────────────── */
+
+#define CUBE_SIZE 56 /* half-extent in GTE units */
+
+static const SVECTOR cube_verts[8] = {
+    {-CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE, 0},
+    {CUBE_SIZE, -CUBE_SIZE, -CUBE_SIZE, 0},
+    {CUBE_SIZE, CUBE_SIZE, -CUBE_SIZE, 0},
+    {-CUBE_SIZE, CUBE_SIZE, -CUBE_SIZE, 0},
+    {-CUBE_SIZE, -CUBE_SIZE, CUBE_SIZE, 0},
+    {CUBE_SIZE, -CUBE_SIZE, CUBE_SIZE, 0},
+    {CUBE_SIZE, CUBE_SIZE, CUBE_SIZE, 0},
+    {-CUBE_SIZE, CUBE_SIZE, CUBE_SIZE, 0},
+};
+
+/*  6 quad faces. Vertex order: v0 v1 v2 v3 for POLY_FT4. */
+static const int cube_faces[6][4] = {
+    {4, 5, 7, 6}, /* front  (+Z) → face 1 */
+    {1, 0, 2, 3}, /* back   (-Z) → face 6 */
+    {0, 4, 3, 7}, /* left   (-X) → face 2 */
+    {5, 1, 6, 2}, /* right  (+X) → face 5 */
+    {2, 3, 6, 7}, /* top    (+Y) → face 3 */
+    {0, 1, 4, 5}, /* bottom (-Y) → face 4 */
+};
+
+/* Die value each face shows. Opposite faces sum to 7. */
+static const int face_value[6] = {1, 6, 2, 5, 3, 4};
+
+/* Face normals (ONE = 4096 in PSX fixed-point). */
+static const SVECTOR face_normals[6] = {
+    {0, 0, ONE, 0},
+    {0, 0, -ONE, 0},
+    {-ONE, 0, 0, 0},
+    {ONE, 0, 0, 0},
+    {0, ONE, 0, 0},
+    {0, -ONE, 0, 0},
+};
+
+/* UV coords for each face in the 192×32 atlas (each die face is 32×32). */
+typedef struct
+{
+    uint8_t u0, v0, u1, v1, u2, v2, u3, v3;
+} FaceUV;
+static FaceUV atlas_uv[6];
+
+static void init_atlas_uvs(void)
+{
+    for (int i = 0; i < 6; i++)
+    {
+        int col = face_value[i] - 1;
+        uint8_t u = (uint8_t)(col * 32);
+        atlas_uv[i].u0 = u;
+        atlas_uv[i].v0 = 0;
+        atlas_uv[i].u1 = u + 31;
+        atlas_uv[i].v1 = 0;
+        atlas_uv[i].u2 = u;
+        atlas_uv[i].v2 = 31;
+        atlas_uv[i].u3 = u + 31;
+        atlas_uv[i].v3 = 31;
+    }
+}
+
+/* ── Simple LCG random ──────────────────────────────────────────────── */
+
+static uint32_t rng_state = 1;
+
+static void seed_rng(uint32_t s) { rng_state = s ? s : 1; }
+
+static uint32_t rand_next(void)
+{
+    rng_state = rng_state * 1664525u + 1013904223u;
+    return rng_state;
+}
+
+static int rand_range(int lo, int hi)
+{
+    return lo + (int)(rand_next() % (uint32_t)(hi - lo + 1));
+}
+
+/* ── Dice physics ───────────────────────────────────────────────────── */
 
 typedef struct
 {
-   int x, y;
-   int vel_x, vel_y;
-} Ball;
+    int32_t rx, ry, rz;    /* rotation (PSX angle, full circle = 4096) */
+    int32_t vrx, vry, vrz; /* angular velocity (angle-units / frame) */
+    int32_t pos_y;         /* vertical position (fixed-point 20.12) */
+    int32_t vel_y;         /* vertical velocity */
+    int32_t ground_y;
+    int bounces;
+} DicePhysics;
 
-typedef struct
+#define VEL_DAMP 63257 /* ~0.965 × 65536 */
+#define VEL_DAMP_SHIFT 16
+#define GRAVITY (FP_ONE / 8)
+#define RESTITUTION (FP_ONE * 55 / 100)
+#define SETTLE_THRESHOLD 3
+
+static void dice_start_roll(DicePhysics *d, uint32_t frame_counter)
 {
-   int y;
-   int score;
-} Paddle;
+    seed_rng(frame_counter * 7919u + 104729u);
+    d->vrx = rand_range(40, 100) * (rand_next() & 1 ? 1 : -1);
+    d->vry = rand_range(40, 100) * (rand_next() & 1 ? 1 : -1);
+    d->vrz = rand_range(30, 80) * (rand_next() & 1 ? 1 : -1);
+    d->pos_y = INT_TO_FP(-200);
+    d->vel_y = 0;
+    d->ground_y = INT_TO_FP(0);
+    d->bounces = 0;
+}
+
+/* returns 1 when the die has settled */
+static int dice_update(DicePhysics *d)
+{
+    d->vrx = (int32_t)(((int64_t)d->vrx * VEL_DAMP) >> VEL_DAMP_SHIFT);
+    d->vry = (int32_t)(((int64_t)d->vry * VEL_DAMP) >> VEL_DAMP_SHIFT);
+    d->vrz = (int32_t)(((int64_t)d->vrz * VEL_DAMP) >> VEL_DAMP_SHIFT);
+
+    d->rx = (d->rx + d->vrx) & 0xFFF;
+    d->ry = (d->ry + d->vry) & 0xFFF;
+    d->rz = (d->rz + d->vrz) & 0xFFF;
+
+    d->vel_y += GRAVITY;
+    d->pos_y += d->vel_y;
+
+    if (d->pos_y >= d->ground_y)
+    {
+        d->pos_y = d->ground_y;
+        if (d->vel_y > FP_ONE / 4)
+        {
+            d->vel_y = -FP_MUL(d->vel_y, RESTITUTION);
+            d->bounces++;
+        }
+        else
+        {
+            d->vel_y = 0;
+        }
+    }
+
+    int avx = d->vrx < 0 ? -d->vrx : d->vrx;
+    int avy = d->vry < 0 ? -d->vry : d->vry;
+    int avz = d->vrz < 0 ? -d->vrz : d->vrz;
+    int avy2 = d->vel_y < 0 ? -d->vel_y : d->vel_y;
+
+    if (avx < SETTLE_THRESHOLD && avy < SETTLE_THRESHOLD &&
+        avz < SETTLE_THRESHOLD && avy2 < FP_ONE / 8 &&
+        d->pos_y >= d->ground_y - FP_ONE)
+    {
+        d->rx = (((d->rx + 512) & ~0x3FF) + 200) & 0xFFF;
+        d->ry = (((d->ry + 512) & ~0x3FF) + 156) & 0xFFF;
+        d->rz = ((d->rz + 512) & ~0x3FF) & 0xFFF;
+        d->vrx = d->vry = d->vrz = 0;
+        d->vel_y = 0;
+        d->pos_y = d->ground_y;
+        return 1;
+    }
+    return 0;
+}
+
+/* Which face points most upward (+Y) after rotation → die result 1-6. */
+static int dice_result(const DicePhysics *d)
+{
+    MATRIX mtx;
+    SVECTOR rot;
+    rot.vx = d->rx;
+    rot.vy = d->ry;
+    rot.vz = d->rz;
+    RotMatrix(&rot, &mtx);
+
+    int best = 0;
+    int32_t best_y = -99999;
+    for (int i = 0; i < 6; i++)
+    {
+        int32_t ny = ((int32_t)mtx.m[1][0] * face_normals[i].vx +
+                      (int32_t)mtx.m[1][1] * face_normals[i].vy +
+                      (int32_t)mtx.m[1][2] * face_normals[i].vz) >>
+                     12;
+        if (ny > best_y)
+        {
+            best_y = ny;
+            best = i;
+        }
+    }
+    return face_value[best];
+}
+
+/* ── Game states ────────────────────────────────────────────────────── */
 
 typedef enum
 {
-   GAME_MENU,
-   GAME_PLAYING,
-   GAME_PAUSED,
-   GAME_OVER
+    STATE_MENU,
+    STATE_ROLLING,
+    STATE_RESULT
 } GameState;
 
-void reset_ball(Ball *ball)
+/* ── Draw the 3D cube ───────────────────────────────────────────────── */
+
+static void draw_cube(RenderContext *ctx, const DicePhysics *d, TIM_IMAGE *tim)
 {
-   ball->x = SCREEN_XRES / 2 - BALL_SIZE / 2;
-   ball->y = SCREEN_YRES / 2 - BALL_SIZE / 2;
-   // Random direction: either left or right
-   ball->vel_x = (ball->x % 2 == 0) ? INITIAL_BALL_SPEED : -INITIAL_BALL_SPEED;
-   ball->vel_y = (ball->y % 3 == 0) ? 1 : -1;
-}
+    MATRIX mtx;
+    SVECTOR rot;
+    VECTOR trans;
 
-void update_ball(Ball *ball, Paddle *left_paddle, Paddle *right_paddle)
-{
-   // Move ball
-   ball->x += ball->vel_x;
-   ball->y += ball->vel_y;
+    rot.vx = d->rx;
+    rot.vy = d->ry;
+    rot.vz = d->rz;
+    RotMatrix(&rot, &mtx);
 
-   // Bounce off top and bottom walls
-   if (ball->y <= 0 || ball->y >= SCREEN_YRES - BALL_SIZE)
-   {
-      ball->vel_y = -ball->vel_y;
-      ball->y = (ball->y <= 0) ? 0 : SCREEN_YRES - BALL_SIZE;
-   }
+    trans.vx = 0;
+    trans.vy = FP_TO_INT(d->pos_y) - 20;
+    trans.vz = 500;
+    TransMatrix(&mtx, &trans);
 
-   // Check collision with left paddle
-   if (ball->x <= PADDLE_WIDTH + PADDLE_MARGIN &&
-       ball->y + BALL_SIZE >= left_paddle->y &&
-       ball->y <= left_paddle->y + PADDLE_HEIGHT)
-   {
-      ball->vel_x = -ball->vel_x;
-      ball->x = PADDLE_WIDTH + PADDLE_MARGIN;
-      // Add some vertical velocity based on where ball hits paddle
-      int hit_pos = (ball->y + BALL_SIZE / 2) - (left_paddle->y + PADDLE_HEIGHT / 2);
-      ball->vel_y += hit_pos / 15;
-   }
+    gte_SetRotMatrix(&mtx);
+    gte_SetTransMatrix(&mtx);
 
-   // Check collision with right paddle
-   if (ball->x + BALL_SIZE >= SCREEN_XRES - PADDLE_WIDTH - PADDLE_MARGIN &&
-       ball->y + BALL_SIZE >= right_paddle->y &&
-       ball->y <= right_paddle->y + PADDLE_HEIGHT)
-   {
-      ball->vel_x = -ball->vel_x;
-      ball->x = SCREEN_XRES - PADDLE_WIDTH - BALL_SIZE - PADDLE_MARGIN;
-      // Add some vertical velocity based on where ball hits paddle
-      int hit_pos = (ball->y + BALL_SIZE / 2) - (right_paddle->y + PADDLE_HEIGHT / 2);
-      ball->vel_y += hit_pos / 15;
-   }
+    uint16_t tpage = getTPage(tim->mode & 0x3, 0,
+                              tim->prect->x, tim->prect->y);
+    uint16_t clut = 0;
+    if (tim->mode & 0x8)
+        clut = getClut(tim->crect->x, tim->crect->y);
 
-   // Limit ball velocity
-   if (ball->vel_y > 3)
-      ball->vel_y = 3;
-   if (ball->vel_y < -3)
-      ball->vel_y = -3;
-}
-
-int check_scoring(Ball *ball, Paddle *left_paddle, Paddle *right_paddle)
-{
-   // Check if ball went off screen
-   if (ball->x < 0)
-   {
-      right_paddle->score++;
-      return 1; // Right player scored
-   }
-   if (ball->x > SCREEN_XRES)
-   {
-      left_paddle->score++;
-      return 2; // Left player scored
-   }
-   return 0; // No score
-}
-
-void draw_paddle(RenderContext *ctx, int x, int y)
-{
-   TILE *tile = (TILE *)new_primitive(ctx, 1, sizeof(TILE));
-   setTile(tile);
-   setXY0(tile, x, y);
-   setWH(tile, PADDLE_WIDTH, PADDLE_HEIGHT);
-   setRGB0(tile, 255, 255, 255);
-}
-
-// Replace the existing draw_ball function with this:
-void draw_ball(RenderContext *ctx, Ball *ball, TIM_IMAGE *tim_ball)
-{
-    SPRT_16 *sprt = (SPRT_16 *)new_primitive(ctx, 1, sizeof(SPRT_16));
-
-    // Initialize sprite properties
-    setSprt16(sprt);
-    setXY0(sprt, ball->x, ball->y);
-    setRGB0(sprt, 128, 128, 128); // Neutral color (no tint)
-    setUV0(sprt, 0, 0);
-
-    // Configure texture properties from TIM image
-    if (tim_ball->mode & 0x8) // Check if CLUT exists
+    for (int f = 0; f < 6; f++)
     {
-        setClut(sprt, tim_ball->crect->x, tim_ball->crect->y);
+        const int *idx = cube_faces[f];
+        long otz, p, flg;
+
+        SVECTOR v0 = cube_verts[idx[0]];
+        SVECTOR v1 = cube_verts[idx[1]];
+        SVECTOR v2 = cube_verts[idx[2]];
+        SVECTOR v3 = cube_verts[idx[3]];
+
+        /* project v0, v1, v2 */
+        gte_ldv3(&v0, &v1, &v2);
+        gte_rtpt();
+
+        /* backface cull — front-facing = negative nclip on PS1 */
+        gte_nclip();
+        gte_stopz(&p);
+        if (p >= 0)
+            continue;
+
+        /* save screen XY for v0, v1, v2 before pipeline shifts */
+        int32_t sxy0, sxy1, sxy2;
+        gte_stsxy0(&sxy0);
+        gte_stsxy1(&sxy1);
+        gte_stsxy2(&sxy2);
+
+        /* project v3 — SZ pipeline now holds all 4 Z values */
+        gte_ldv0(&v3);
+        gte_rtps();
+
+        int32_t sxy3;
+        gte_stsxy2(&sxy3);
+
+        /* average Z for depth-sort */
+        gte_avsz4();
+        gte_stotz(&otz);
+        if (otz <= 0 || otz >= OT_LENGTH)
+            continue;
+
+        POLY_FT4 *poly = (POLY_FT4 *)new_primitive(ctx, otz, sizeof(POLY_FT4));
+        setPolyFT4(poly);
+
+        /* write saved screen coords into polygon */
+        *(int32_t *)&poly->x0 = sxy0;
+        *(int32_t *)&poly->x1 = sxy1;
+        *(int32_t *)&poly->x2 = sxy2;
+        *(int32_t *)&poly->x3 = sxy3;
+
+        /* texture coords from atlas */
+        FaceUV *uv = &atlas_uv[f];
+        setUV4(poly, uv->u0, uv->v0, uv->u1, uv->v1,
+                      uv->u2, uv->v2, uv->u3, uv->v3);
+
+        poly->tpage = tpage;
+        poly->clut = clut;
+        setRGB0(poly, 128, 128, 128);
     }
-
-    // Set texture page and UV coordinates
-    DR_TPAGE *tpri = (DR_TPAGE *)new_primitive(ctx, 1, sizeof(DR_TPAGE));
-    setDrawTPage(tpri, 0, 0, getTPage(tim_ball->mode & 0x3, 0, tim_ball->prect->x, tim_ball->prect->y));
 }
 
-void draw_center_line(RenderContext *ctx)
+/* ── Ground plane ───────────────────────────────────────────────────── */
+
+static void draw_ground(RenderContext *ctx)
 {
-   for (int y = 0; y < SCREEN_YRES; y += 16)
-   {
-      TILE *tile = (TILE *)new_primitive(ctx, 0, sizeof(TILE));
-      setTile(tile);
-      setXY0(tile, SCREEN_XRES / 2 - 1, y);
-      setWH(tile, 2, 8);
-      setRGB0(tile, 128, 128, 128);
-   }
+    TILE *t = (TILE *)new_primitive(ctx, OT_LENGTH - 2, sizeof(TILE));
+    setTile(t);
+    setXY0(t, 0, 160);
+    setWH(t, SCREEN_XRES, SCREEN_YRES - 160);
+    setRGB0(t, 20, 20, 50);
 }
 
-bool load_texture_to_context(RenderContext *ctx, TIM_IMAGE *image, u_long tim_data[])
-{
-
-   GetTimInfo(tim_data, image); /* Get TIM parameters */
-
-   LoadImage(image->prect, image->paddr); /* Upload texture to VRAM */
-   if (image->mode & 0x8)
-   {
-      LoadImage(image->crect, image->caddr); /* Upload CLUT if present */
-   }
-
-   return true;
-}
-
-TIM_IMAGE tim_ball_image; // Declared globally or in main scope
+/* ── Main ───────────────────────────────────────────────────────────── */
 
 int main(int argc, const char **argv)
 {
-   // Initialize the GPU and load the default font texture provided by PSn00bSDK at (960, 0) in VRAM.
-   ResetGraph(0);
-   FntLoad(960, 0);
+    ResetGraph(0);
+    FntLoad(960, 0);
+    FntOpen(0, 0, SCREEN_XRES, SCREEN_YRES, 0, 512);
 
-   // Set up our rendering context.
-   RenderContext ctx;
-   initialize_render_context(&ctx, SCREEN_XRES, SCREEN_YRES, 0, 0, 60); // Dark blue background
+    RenderContext ctx;
+    initialize_render_context(&ctx, SCREEN_XRES, SCREEN_YRES, 10, 10, 40);
 
-   if (!load_texture_to_context(&ctx, &tim_ball_image, tim_ball16c))
-   {
-      printf("Failed to upload texture.\n");
-      return 1;
-   }
+    InitGeom();
+    gte_SetGeomOffset(SCREEN_XRES / 2, SCREEN_YRES / 2);
+    gte_SetGeomScreen(350);
 
-   // Initialize game pads for both players
-   GamePad pad1 = init_game_pad(0); // Player 1 (left paddle)
-   GamePad pad2 = init_game_pad(1); // Player 2 (right paddle)
+    /* Set ZSF3/ZSF4 for gte_avsz3/4 depth sorting.
+       OTZ = ZSFn * sum(SZ) / 4096.  Typical: ZSF3 = OT/3, ZSF4 = OT/4. */
+    {
+        int zsf3 = OT_LENGTH / 3;
+        int zsf4 = OT_LENGTH / 4;
+        __asm__ volatile("ctc2 %0, $29" : : "r"(zsf3));
+        __asm__ volatile("ctc2 %0, $30" : : "r"(zsf4));
+    }
 
-   // Game state
-   GameState state = GAME_MENU;
-   Ball ball;
+    load_tim(&dice_tim, tim_dice_atlas);
+    init_atlas_uvs();
 
-   Paddle left_paddle = {SCREEN_YRES / 2 - PADDLE_HEIGHT / 2, 0};
-   Paddle right_paddle = {SCREEN_YRES / 2 - PADDLE_HEIGHT / 2, 0};
+    GamePad pad = init_game_pad(0);
 
-   reset_ball(&ball);
+    GameState state = STATE_MENU;
+    DicePhysics dice = {0};
+    dice.pos_y = INT_TO_FP(0);
+    uint32_t frame_counter = 0;
+    int roll_result = 0;
+    char text_buf[64];
 
-   SPRT_16 *sprt;
+    for (;;)
+    {
+        sync_pad(&pad);
+        frame_counter++;
 
-   for (;;)
-   {
-      // Sync pad states
-      sync_pad(&pad1);
-      sync_pad(&pad2);
+        switch (state)
+        {
+        case STATE_MENU:
+            draw_text(&ctx, 88, 60, 0, "DICE ROLLER");
+            draw_text(&ctx, 72, 120, 0, "PRESS X TO ROLL");
+            draw_text(&ctx, 60, 180, 0, "PS1 HOMEBREW DEMO");
 
-      char text_buffer[256];
+            dice.rx = (frame_counter * 8) & 0xFFF;
+            dice.ry = (frame_counter * 6) & 0xFFF;
+            dice.rz = 0;
+            dice.pos_y = INT_TO_FP(0);
+            draw_cube(&ctx, &dice, &dice_tim);
+            draw_ground(&ctx);
 
-      switch (state)
-      {
-      case GAME_MENU:
-         draw_text(&ctx, SCREEN_XRES / 2 - 32, SCREEN_YRES / 2 - 40, 0, "PONG");
-         draw_text(&ctx, SCREEN_XRES / 2 - 80, SCREEN_YRES / 2 - 16, 0, "PRESS X TO START");
-         draw_text(&ctx, SCREEN_XRES / 2 - 120, SCREEN_YRES / 2 + 8, 0, "PLAYER 1: LEFT PADDLE (PAD 1)");
-         draw_text(&ctx, SCREEN_XRES / 2 - 120, SCREEN_YRES / 2 + 24, 0, "PLAYER 2: RIGHT PADDLE (PAD 2)");
-         draw_text(&ctx, SCREEN_XRES / 2 - 80, SCREEN_YRES / 2 + 48, 0, "USE D-PAD UP/DOWN");
-
-         if (is_button_just_released(&pad1, PAD_BUTTON_CIRCLE))
-         {
-            state = GAME_PLAYING;
-            left_paddle.score = 0;
-            right_paddle.score = 0;
-            reset_ball(&ball);
-         }
-
-         break;
-
-      case GAME_PLAYING:
-
-         if (pad1.connected)
-         {
-            if (pad1.dpad.up && left_paddle.y > 0)
+            if (is_button_just_released(&pad, PAD_BUTTON_X))
             {
-               left_paddle.y -= PADDLE_SPEED;
+                dice_start_roll(&dice, frame_counter);
+                state = STATE_ROLLING;
             }
-            if (pad1.dpad.down && left_paddle.y < SCREEN_YRES - PADDLE_HEIGHT)
+            break;
+
+        case STATE_ROLLING:
+            draw_text(&ctx, 104, 16, 0, "ROLLING...");
+
+            if (dice_update(&dice))
             {
-               left_paddle.y += PADDLE_SPEED;
+                roll_result = dice_result(&dice);
+                state = STATE_RESULT;
             }
 
-            // Handle analog stick for player 1
-            if (is_analog_available(&pad1))
+            draw_cube(&ctx, &dice, &dice_tim);
+            draw_ground(&ctx);
+            break;
+
+        case STATE_RESULT:
+            sprintf(text_buf, "YOU ROLLED: %d", roll_result);
+            draw_text(&ctx, 80, 16, 0, text_buf);
+            draw_text(&ctx, 64, 210, 0, "X: ROLL AGAIN");
+
+            draw_cube(&ctx, &dice, &dice_tim);
+            draw_ground(&ctx);
+
+            if (is_button_just_released(&pad, PAD_BUTTON_X))
             {
-               float analog_y = get_analog_y_normalized(&pad1, true);
-               left_paddle.y += (int)(analog_y * PADDLE_SPEED);
+                dice_start_roll(&dice, frame_counter);
+                state = STATE_ROLLING;
             }
-         }
-         else
-         {
-            // AI for left paddle if no controller
-            int ball_center = ball.y + BALL_SIZE / 2;
-            int paddle_center = left_paddle.y + PADDLE_HEIGHT / 2;
-            if (ball_center < paddle_center - 10)
-            {
-               left_paddle.y -= PADDLE_SPEED - 2;
-            }
-            else if (ball_center > paddle_center + 10)
-            {
-               left_paddle.y += PADDLE_SPEED - 2;
-            }
-         }
+            break;
+        }
 
-         // Player 2 (right paddle) controls
-         if (pad2.connected)
-         {
-            if (pad2.dpad.up && right_paddle.y > 0)
-            {
-               right_paddle.y -= PADDLE_SPEED;
-            }
-            if (pad2.dpad.down && right_paddle.y < SCREEN_YRES - PADDLE_HEIGHT)
-            {
-               right_paddle.y += PADDLE_SPEED;
-            }
+        flip_buffers(&ctx);
+    }
 
-            // Handle analog stick for player 2
-            if (is_analog_available(&pad2))
-            {
-               float analog_y = get_analog_y_normalized(&pad2, true);
-               right_paddle.y += (int)(analog_y * PADDLE_SPEED);
-            }
-         }
-         else
-         {
-            // AI for right paddle if no controller
-            int ball_center = ball.y + BALL_SIZE / 2;
-            int paddle_center = right_paddle.y + PADDLE_HEIGHT / 2;
-            if (ball_center < paddle_center - 10)
-            {
-               right_paddle.y -= PADDLE_SPEED - 1;
-            }
-            else if (ball_center > paddle_center + 10)
-            {
-               right_paddle.y += PADDLE_SPEED - 1;
-            }
-         }
-
-         // Keep paddles in bounds
-         if (left_paddle.y < 0)
-            left_paddle.y = 0;
-         if (left_paddle.y > SCREEN_YRES - PADDLE_HEIGHT)
-            left_paddle.y = SCREEN_YRES - PADDLE_HEIGHT;
-         if (right_paddle.y < 0)
-            right_paddle.y = 0;
-         if (right_paddle.y > SCREEN_YRES - PADDLE_HEIGHT)
-            right_paddle.y = SCREEN_YRES - PADDLE_HEIGHT;
-
-         // Update ball
-         update_ball(&ball, &left_paddle, &right_paddle);
-
-         // Check for scoring
-         int scored = check_scoring(&ball, &left_paddle, &right_paddle);
-         if (scored)
-         {
-            reset_ball(&ball);
-            if (left_paddle.score >= 5 || right_paddle.score >= 5)
-            {
-               state = GAME_OVER;
-            }
-         }
-
-         // Pause functionality
-         if ((pad1.connected && pad1.face.triangle) || (pad2.connected && pad2.face.triangle))
-         {
-            state = GAME_PAUSED;
-         }
-
-         // Draw game elements
-         draw_center_line(&ctx);
-         draw_paddle(&ctx, PADDLE_MARGIN, left_paddle.y);
-         draw_paddle(&ctx, SCREEN_XRES - PADDLE_WIDTH - PADDLE_MARGIN, right_paddle.y);
-         draw_ball(&ctx, &ball, &tim_ball_image);
-
-         // Draw scores
-         sprintf(text_buffer, "%d", left_paddle.score);
-         draw_text(&ctx, SCREEN_XRES / 2 - 40, 20, 0, text_buffer);
-         sprintf(text_buffer, "%d", right_paddle.score);
-         draw_text(&ctx, SCREEN_XRES / 2 + 32, 20, 0, text_buffer);
-
-         // Draw controller status
-         draw_text(&ctx, 8, SCREEN_YRES - 16, 0, pad1.connected ? "P1: OK" : "P1: AI");
-         draw_text(&ctx, SCREEN_XRES - 48, SCREEN_YRES - 16, 0, pad2.connected ? "P2: OK" : "P2: AI");
-         break;
-
-      case GAME_PAUSED:
-         draw_text(&ctx, SCREEN_XRES / 2 - 24, SCREEN_YRES / 2, 0, "PAUSED");
-         draw_text(&ctx, SCREEN_XRES / 2 - 64, SCREEN_YRES / 2 + 16, 0, "TRIANGLE TO RESUME");
-
-         if ((pad1.connected && pad1.face.triangle) || (pad2.connected && pad2.face.triangle))
-         {
-            state = GAME_PLAYING;
-         }
-         break;
-
-      case GAME_OVER:
-         draw_text(&ctx, SCREEN_XRES / 2 - 32, SCREEN_YRES / 2 - 16, 0, "GAME OVER");
-         if (left_paddle.score >= 5)
-         {
-            draw_text(&ctx, SCREEN_XRES / 2 - 48, SCREEN_YRES / 2, 0, "PLAYER 1 WINS!");
-         }
-         else
-         {
-            draw_text(&ctx, SCREEN_XRES / 2 - 48, SCREEN_YRES / 2, 0, "PLAYER 2 WINS!");
-         }
-         draw_text(&ctx, SCREEN_XRES / 2 - 72, SCREEN_YRES / 2 + 24, 0, "PRESS X TO PLAY AGAIN");
-
-         if ((pad1.connected && pad1.face.x) || (pad2.connected && pad2.face.x))
-         {
-            state = GAME_MENU;
-         }
-         break;
-      }
-
-      flip_buffers(&ctx);
-   }
-
-   // Cleanup (though this won't be reached in this example)
-   cleanup_game_pad(&pad1);
-   cleanup_game_pad(&pad2);
-   return 0;
+    cleanup_game_pad(&pad);
+    return 0;
 }

@@ -67,7 +67,7 @@ parcel:
 	@ruby ./tools/parcel/main.rb;
 
 png2tim:
-	docker run --platform linux/amd64 --rm -v $(PWD)/src:/workspace/src -v $(PWD)/out:/workspace/build -w /workspace/src psn00bsdk sh -c "cd /workspace/src/assets && /opt/png2tim/png2tim.sh"
+	docker run --platform linux/amd64 --rm -v $(PWD)/src:/workspace/src -v $(PWD)/tools/png2tim/png2tim.sh:/opt/png2tim/png2tim.sh -v $(PWD)/out:/workspace/build -w /workspace/src psn00bsdk sh -c "cd /workspace/src/assets && sh /opt/png2tim/png2tim.sh"
 
 rename:
 	@if [ -z "$(NEW_NAME)" ]; then \

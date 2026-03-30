@@ -2,52 +2,41 @@
 
 <img width="780" height="656" alt="dd17c459-db63-4716-b1c9-0c54e334f0a3" src="https://github.com/user-attachments/assets/0e3a35d6-5a0b-4155-a058-cef79631196a" />
 
-This repository provides a Docker-based development environment for PlayStation 1 (PS1) game development. It includes tools and libraries necessary for building PS1 games, along with a Makefile to streamline the build process.
+A dice-throwing program written as a PlayStation 1 game ROM.
 
-This project is based on [PSn00bSDK](https://github.com/Lameguy64/PSn00bSDK) please check it out for more information about SDK capabilities.
-## Dependencies
+This project is based on [ps1_dev](https://github.com/marconvcm/ps1_dev) (MIT-licensed), which is in turn based on [PSn00bSDK](https://github.com/Lameguy64/PSn00bSDK).
+
+## Build
+
+Dependencies:
 - Docker
 - Ruby
 - Make
 - PS1 emulator (e.g., DuckStation)
 
-## How to build
 To build the project, follow these steps:
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/marconvcm/ps1_dev.git my_game
-cd my_game && rm -rf .git && git init
-```
-
-2. Build the Docker image:
-```bash
+# 1. Clone the repository:
+git clone --recurse-submodules https://github.com/tslmy/ps1-dice.git
+# 2. Build the Docker image:
 make prepare
-```
-
-3. Build game:
-```bash
+# 3. Build game:
 make build
-```
-
-4. Run the game:
-```bash
-# Only works if you have DuckStation set up correctly.
-DUCKSTATION=/path/to/duckstation make emulate
-```
-
-5. Distribute the game:
-```bash
+# 4. Run the game:
+DUCKSTATION=/Applications/DuckStation.app/Contents/MacOS/DuckStation make emulate
+# 5. Distribute the game:
 make dist
 ```
+
 It will create a zip file in the `dist` directory containing the game files.
 
+## Plan
 
-## Contributing
-Contributions are welcome! If you have suggestions for improvements or new features, feel free to open an issue or submit a pull request.
+Here's our roadmap next up:
 
-## How to run
-To run the PS1 game, you can use an emulator like DuckStation. Open cue file in the `out` directory with DuckStation or any other PS1 emulator of your choice.
-
-## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details
+1. Add support for multiple dices. Consider their collisions.
+2. Add support for different types of dices (D4, D6, D8, D10, D12, and D20).
+3. Add a "dock"/"hotbar" at the bottom of the screen, like the one you see in Minecraft. Using the D-pad,
+   - Use left & right buttons to select through different types of dices.
+   - Use up & down buttons to dial up & down numbers of the dice type currently highlighted.

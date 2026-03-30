@@ -1,5 +1,7 @@
 # Dice-throwing app for PS1
 
+<img width="780" height="656" alt="dd17c459-db63-4716-b1c9-0c54e334f0a3" src="https://github.com/user-attachments/assets/0e3a35d6-5a0b-4155-a058-cef79631196a" />
+
 This repository provides a Docker-based development environment for PlayStation 1 (PS1) game development. It includes tools and libraries necessary for building PS1 games, along with a Makefile to streamline the build process.
 
 This project is based on [PSn00bSDK](https://github.com/Lameguy64/PSn00bSDK) please check it out for more information about SDK capabilities.
